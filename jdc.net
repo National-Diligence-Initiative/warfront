@@ -8,6 +8,649 @@ using System.Text.Json;
 // CONTRACTS
 // ==============================
 
+// ==============================
+// SOURCE-GENERATED LOGGING
+// ==============================
+
+public static partial class CovaxLog
+{
+    [LoggerMessage(
+        EventId = 1001,
+        Level = LogLevel.Information,
+        Message = "Prepared Covax request {Operation} {CorrelationId} payload={Payload}")]
+    public static partial void PreparedRequest(
+        ILogger logger,
+        string operation,
+        string correlationId,
+        [CovaxClassifications.Private] string payload);
+
+    [LoggerMessage(
+        EventId = 1002,
+        Level = LogLevel.Information,
+        Message = "Received Covax response {StatusCode} {CorrelationId} payload={Payload}")]
+    public static partial void ReceivedResponse(
+        ILogger logger,
+        int statusCode,
+        string correlationId,
+        [CovaxClassifications.Private] string payload);
+}
+
+// ==============================
+// ADAPTER PATCH
+// ==============================
+
+public sealed class CovaxAdapter : ICovaxAdapter
+{
+    private readonly HttpClient _http;
+    private readonly CovaxAdapterOptions _options;
+    private readonly AuditLedger _ledger;
+    private readonly string _scope;
+    private readonly CovaxAutoRedactor _autoRedactor;
+    private readonly ILogger<CovaxAdapter> _logger;
+
+    public CovaxAdapter(
+        HttpClient http,
+        CovaxAdapterOptions options,
+        AuditLedger ledger,
+        string scope,
+        CovaxAutoRedactor autoRedactor,
+        ILogger<CovaxAdapter> logger)
+    {
+        _http = http;
+        _options = options;
+        _ledger = ledger;
+        _scope = scope;
+        _autoRedactor = autoRedactor;
+        _logger = logger;
+    }
+
+    public async Task<CovaxResponse> SendAsync(CovaxRequest request, CancellationToken ct = default)
+    {
+        ValidateScope();
+        ValidateRequest(request);
+
+        // Auto-redact only for logs/audit. Do not mutate the outbound payload here.
+        var redactedPayload = _autoRedactor.RedactJson(request.PayloadJson);
+
+        _ledger.Append(
+            "covax.request.prepare",
+            request.CorrelationId,
+            $"{request.Operation}|{redactedPayload}");
+
+        CovaxLog.PreparedRequest(
+            _logger,
+            request.Operation,
+            request.CorrelationId,
+            redactedPayload);
+
+        var canonical = $"{request.CorrelationId}|{request.Operation}|{request.PayloadJson}";
+        var signature = Hashing.HmacBase64(_options.HmacSecret, canonical);
+
+        using var msg = new HttpRequestMessage(HttpMethod.Post, BuildUri(request.Operation));
+        msg.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _options.ApiKey);
+        msg.Headers.Add("X-Correlation-Id", request.CorrelationId);
+        msg.Headers.Add("X-Covax-Signature", signature);
+        msg.Content = new StringContent(request.PayloadJson, System.Text.Encoding.UTF8, "application/json");
+
+        HttpResponseMessage rsp;
+        try
+        {
+            rsp = await _http.SendAsync(msg, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _ledger.Append("covax.request.error", request.CorrelationId, ex.Message);
+            _logger.LogError(ex, "Covax transport error for {CorrelationId}", request.CorrelationId);
+
+            return new CovaxResponse
+            {
+                Ok = false,
+                StatusCode = 0,
+                Message = $"Transport error: {ex.Message}"
+            };
+        }
+
+        var body = await rsp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        var redactedResponse = _autoRedactor.RedactJson(body);
+
+        _ledger.Append("covax.response.received", request.CorrelationId, redactedResponse);
+
+        CovaxLog.ReceivedResponse(
+            _logger,
+            (int)rsp.StatusCode,
+            request.CorrelationId,
+            redactedResponse);
+
+        return new CovaxResponse
+        {
+            Ok = rsp.IsSuccessStatusCode,
+            StatusCode = (int)rsp.StatusCode,
+            Message = rsp.ReasonPhrase ?? "",
+            BodyJson = body
+        };
+    }
+
+    private void ValidateScope()
+    {
+        if (!_options.AllowedScopes.Contains(_scope))
+            throw new UnauthorizedAccessException($"Scope '{_scope}' is not permitted.");
+    }
+
+    private void ValidateRequest(CovaxRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.CorrelationId))
+            throw new ArgumentException("CorrelationId is required.");
+
+        if (string.IsNullOrWhiteSpace(request.Operation))
+            throw new ArgumentException("Operation is required.");
+
+        if (!_options.AllowedOperations.Contains(request.Operation))
+            throw new InvalidOperationException($"Operation '{request.Operation}' is not allowlisted.");
+
+        if (request.PayloadJson.Length > 250_000)
+            throw new InvalidOperationException("Payload too large.");
+    }
+
+    private Uri BuildUri(string operation)
+    {
+        var baseUri = _options.BaseUrl.EndsWith("/") ? _options.BaseUrl : _options.BaseUrl + "/";
+        return new Uri($"{baseUri}api/covax/{operation.Replace('.', '/')}");
+    }
+}
+
+// ==============================
+// AUTO REDACTOR
+// ==============================
+
+public sealed class CovaxAutoRedactor
+{
+    private readonly IRedactorProvider _provider;
+
+    // Field-name to classification map.
+    private static readonly Dictionary<string, DataClassification> FieldMap =
+        new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ssn"] = CovaxClassifications.Secret,
+            ["socialsecuritynumber"] = CovaxClassifications.Secret,
+            ["dob"] = CovaxClassifications.Private,
+            ["birthdate"] = CovaxClassifications.Private,
+            ["passport"] = CovaxClassifications.Secret,
+            ["driverlicense"] = CovaxClassifications.Secret,
+            ["license"] = CovaxClassifications.Private,
+            ["apikey"] = CovaxClassifications.Secret,
+            ["token"] = CovaxClassifications.Secret,
+            ["secret"] = CovaxClassifications.Secret,
+            ["authorization"] = CovaxClassifications.Secret,
+            ["email"] = CovaxClassifications.Private,
+            ["phone"] = CovaxClassifications.Private,
+            ["caseid"] = CovaxClassifications.Correlatable,
+            ["subjectid"] = CovaxClassifications.Correlatable,
+            ["recordid"] = CovaxClassifications.Correlatable
+        };
+
+    public CovaxAutoRedactor(IRedactorProvider provider)
+    {
+        _provider = provider;
+    }
+
+    public string RedactJson(string json)
+    {
+        if (string.IsNullOrWhiteSpace(json))
+            return "{}";
+
+        JsonNode? node = JsonNode.Parse(json);
+        if (node is null)
+            return "{}";
+
+        RedactNode(node, parentKey: null);
+        return node.ToJsonString(new JsonSerializerOptions { WriteIndented = false });
+    }
+
+    private void RedactNode(JsonNode node, string? parentKey)
+    {
+        if (node is JsonObject obj)
+        {
+            foreach (var kvp in obj.ToList())
+            {
+                if (kvp.Value is null) continue;
+
+                if (kvp.Value is JsonValue val)
+                {
+                    obj[kvp.Key] = RedactValue(kvp.Key, val);
+                }
+                else
+                {
+                    RedactNode(kvp.Value, kvp.Key);
+                }
+            }
+
+            return;
+        }
+
+        if (node is JsonArray arr)
+        {
+            for (int i = 0; i < arr.Count; i++)
+            {
+                var item = arr[i];
+                if (item is null) continue;
+
+                if (item is JsonValue val)
+                {
+                    arr[i] = RedactValue(parentKey ?? "value", val);
+                }
+                else
+                {
+                    RedactNode(item, parentKey);
+                }
+            }
+        }
+    }
+
+    private JsonNode RedactValue(string fieldName, JsonValue value)
+    {
+        if (!FieldMap.TryGetValue(Normalize(fieldName), out var classification))
+            return value;
+
+        var raw = value.ToJsonString().Trim('"');
+        var redactor = _provider.GetRedactor(new DataClassificationSet(classification));
+        var redacted = redactor.Redact(raw);
+
+        return JsonValue.Create(redacted)!;
+    }
+
+    private static string Normalize(string input) =>
+        new string(input.Where(char.IsLetterOrDigit).ToArray()).ToLowerInvariant();
+}
+
+// ==============================
+// DI REGISTRATION
+// ==============================
+
+var services = new ServiceCollection();
+
+services.AddLogging(builder =>
+{
+    builder.EnableRedaction();
+    builder.AddSimpleConsole();
+});
+
+services.AddRedaction(builder =>
+{
+    // Full erase for secrets/private fields.
+    builder.SetRedactor<ErasingRedactor>(
+        CovaxClassifications.Secret,
+        CovaxClassifications.Private);
+
+    // Optional: use HMAC for correlatable IDs instead of plain erase.
+    // builder.SetHmacRedactor(
+    //     options =>
+    //     {
+    //         options.KeyId = 1;
+    //         options.Key = "BASE64_ENCODED_KEY_AT_LEAST_44_CHARS_LONG_HERE";
+    //     },
+    //     CovaxClassifications.Correlatable);
+});
+
+services.AddSingleton<CovaxAutoRedactor>();
+
+using Microsoft.Extensions.Compliance.Classification;
+using Microsoft.Extensions.Compliance.Redaction;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Telemetry;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
+// ==============================
+// CLASSIFICATIONS
+// ==============================
+
+public static class CovaxClassifications
+{
+    public const string TaxonomyName = "Covax";
+
+    public static DataClassification Public => new(TaxonomyName, nameof(Public));
+    public static DataClassification Private => new(TaxonomyName, nameof(Private));
+    public static DataClassification Secret => new(TaxonomyName, nameof(Secret));
+    public static DataClassification Correlatable => new(TaxonomyName, nameof(Correlatable));
+}
+
+// csproj
+<ItemGroup>
+  <PackageReference Include="Microsoft.Extensions.Compliance.Redaction" Version="*" />
+  <PackageReference Include="Microsoft.Extensions.Telemetry" Version="*" />
+</ItemGroup>using System.Net.Http.Headers;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+
+// ==============================
+// CONTRACTS
+// ==============================
+
+public sealed class CovaxRequest
+{
+    public string CorrelationId { get; set; } = Guid.NewGuid().ToString("N");
+    public string Operation { get; set; } = "";
+    public string PayloadJson { get; set; } = "{}";
+    public Dictionary<string, string> Metadata { get; set; } = new();
+}
+
+public sealed class CovaxResponse
+{
+    public bool Ok { get; set; }
+    public int StatusCode { get; set; }
+    public string Message { get; set; } = "";
+    public string BodyJson { get; set; } = "{}";
+}
+
+public interface ICovaxAdapter
+{
+    Task<CovaxResponse> SendAsync(CovaxRequest request, CancellationToken ct = default);
+}
+
+// ==============================
+// OPTIONS
+// ==============================
+
+public sealed class CovaxAdapterOptions
+{
+    public string BaseUrl { get; set; } = "https://internal.example.local/";
+    public string ApiKey { get; set; } = "";
+    public string HmacSecret { get; set; } = "";
+    public HashSet<string> AllowedOperations { get; set; } = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "case.read",
+        "case.write",
+        "audit.read",
+        "oversight.submit"
+    };
+
+    public HashSet<string> AllowedScopes { get; set; } = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "covax.read",
+        "covax.write"
+    };
+}
+
+// ==============================
+// AUDIT
+// ==============================
+
+public sealed class AuditEntry
+{
+    public string EventId { get; set; } = Guid.NewGuid().ToString("N");
+    public DateTimeOffset Utc { get; set; } = DateTimeOffset.UtcNow;
+    public string Action { get; set; } = "";
+    public string CorrelationId { get; set; } = "";
+    public string Detail { get; set; } = "";
+    public string PrevHash { get; set; } = "";
+    public string Hash { get; set; } = "";
+}
+
+public sealed class AuditLedger
+{
+    private readonly List<AuditEntry> _entries = new();
+    private readonly object _gate = new();
+
+    public IReadOnlyList<AuditEntry> Entries => _entries;
+
+    public void Append(string action, string correlationId, string detail)
+    {
+        lock (_gate)
+        {
+            var prev = _entries.Count == 0 ? "GENESIS" : _entries[^1].Hash;
+            var evt = new AuditEntry
+            {
+                Action = action,
+                CorrelationId = correlationId,
+                Detail = detail,
+                PrevHash = prev
+            };
+            evt.Hash = Hashing.Sha256Hex($"{evt.Utc:O}|{evt.Action}|{evt.CorrelationId}|{evt.Detail}|{evt.PrevHash}");
+            _entries.Add(evt);
+        }
+    }
+}
+
+// ==============================
+// SECURITY HELPERS
+// ==============================
+
+public static class Hashing
+{
+    public static string Sha256Hex(string input)
+    {
+        using var sha = SHA256.Create();
+        return Convert.ToHexString(sha.ComputeHash(Encoding.UTF8.GetBytes(input))).ToLowerInvariant();
+    }
+
+    public static string HmacBase64(string secret, string input)
+    {
+        using var hmac = new HMACSHA256(Encoding.UTF8.GetBytes(secret));
+        return Convert.ToBase64String(hmac.ComputeHash(Encoding.UTF8.GetBytes(input)));
+    }
+}
+
+public static class Redaction
+{
+    private static readonly string[] SensitiveKeys =
+    {
+        "ssn", "dob", "birthdate", "passport", "driverlicense", "license", "token", "secret", "apikey"
+    };
+
+    public static string RedactJson(string json)
+    {
+        using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(json) ? "{}" : json);
+        var sanitized = SanitizeElement(doc.RootElement);
+        return JsonSerializer.Serialize(sanitized);
+    }
+
+    private static object? SanitizeElement(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.Object => element.EnumerateObject()
+                .ToDictionary(
+                    p => p.Name,
+                    p => SensitiveKeys.Any(k => p.Name.Contains(k, StringComparison.OrdinalIgnoreCase))
+                        ? (object?)"[REDACTED]"
+                        : SanitizeElement(p.Value)
+                ),
+            JsonValueKind.Array => element.EnumerateArray().Select(SanitizeElement).ToList(),
+            JsonValueKind.String => element.GetString(),
+            JsonValueKind.Number => element.TryGetInt64(out var l) ? l :
+                                    element.TryGetDouble(out var d) ? d : element.ToString(),
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            _ => null
+        };
+    }
+}
+
+// ==============================
+// ADAPTER
+// ==============================
+
+public sealed class CovaxAdapter : ICovaxAdapter
+{
+    private readonly HttpClient _http;
+    private readonly CovaxAdapterOptions _options;
+    private readonly AuditLedger _ledger;
+    private readonly string _scope;
+
+    public CovaxAdapter(HttpClient http, CovaxAdapterOptions options, AuditLedger ledger, string scope)
+    {
+        _http = http;
+        _options = options;
+        _ledger = ledger;
+        _scope = scope;
+    }
+
+    public async Task<CovaxResponse> SendAsync(CovaxRequest request, CancellationToken ct = default)
+    {
+        ValidateScope();
+        ValidateRequest(request);
+
+        var redacted = Redaction.RedactJson(request.PayloadJson);
+        _ledger.Append("covax.request.prepare", request.CorrelationId, $"{request.Operation}|{redacted}");
+
+        var canonical = $"{request.CorrelationId}|{request.Operation}|{request.PayloadJson}";
+        var signature = Hashing.HmacBase64(_options.HmacSecret, canonical);
+
+        using var msg = new HttpRequestMessage(HttpMethod.Post, BuildUri(request.Operation));
+        msg.Headers.Authorization = new AuthenticationHeaderValue("Bearer", _options.ApiKey);
+        msg.Headers.Add("X-Correlation-Id", request.CorrelationId);
+        msg.Headers.Add("X-Covax-Signature", signature);
+
+        foreach (var kv in request.Metadata)
+            msg.Headers.TryAddWithoutValidation($"X-Meta-{kv.Key}", kv.Value);
+
+        msg.Content = new StringContent(request.PayloadJson, Encoding.UTF8, "application/json");
+
+        HttpResponseMessage rsp;
+        try
+        {
+            rsp = await _http.SendAsync(msg, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _ledger.Append("covax.request.error", request.CorrelationId, ex.Message);
+            return new CovaxResponse
+            {
+                Ok = false,
+                StatusCode = 0,
+                Message = $"Transport error: {ex.Message}"
+            };
+        }
+
+        var body = await rsp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        _ledger.Append("covax.response.received", request.CorrelationId, $"{(int)rsp.StatusCode}");
+
+        return new CovaxResponse
+        {
+            Ok = rsp.IsSuccessStatusCode,
+            StatusCode = (int)rsp.StatusCode,
+            Message = rsp.ReasonPhrase ?? "",
+            BodyJson = body
+        };
+    }
+
+    private void ValidateScope()
+    {
+        if (!_options.AllowedScopes.Contains(_scope))
+            throw new UnauthorizedAccessException($"Scope '{_scope}' is not permitted.");
+    }
+
+    private void ValidateRequest(CovaxRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.CorrelationId))
+            throw new ArgumentException("CorrelationId is required.");
+
+        if (string.IsNullOrWhiteSpace(request.Operation))
+            throw new ArgumentException("Operation is required.");
+
+        if (!_options.AllowedOperations.Contains(request.Operation))
+            throw new InvalidOperationException($"Operation '{request.Operation}' is not allowlisted.");
+
+        if (request.PayloadJson.Length > 250_000)
+            throw new InvalidOperationException("Payload too large.");
+
+        if (request.Metadata.Count > 24)
+            throw new InvalidOperationException("Too many metadata entries.");
+    }
+
+    private Uri BuildUri(string operation)
+    {
+        var baseUri = _options.BaseUrl.EndsWith("/") ? _options.BaseUrl : _options.BaseUrl + "/";
+        return new Uri($"{baseUri}api/covax/{operation.Replace('.', '/')}");
+    }
+}
+
+// ==============================
+// SYSTEM WRAPPER
+// ==============================
+
+public sealed class CentralIntelligenceAgency
+{
+    private readonly ICovaxAdapter _covax;
+
+    public CentralIntelligenceAgency(ICovaxAdapter covax)
+    {
+        _covax = covax;
+    }
+
+    public Task<CovaxResponse> SubmitOversightRecordAsync(string payloadJson, CancellationToken ct = default)
+    {
+        var req = new CovaxRequest
+        {
+            Operation = "oversight.submit",
+            PayloadJson = payloadJson,
+            Metadata = new Dictionary<string, string>
+            {
+                ["system"] = "CentralIntelligenceAgency",
+                ["classification"] = "internal"
+            }
+        };
+
+        return _covax.SendAsync(req, ct);
+    }
+
+    public Task<CovaxResponse> ReadCaseAsync(string caseId, CancellationToken ct = default)
+    {
+        var req = new CovaxRequest
+        {
+            Operation = "case.read",
+            PayloadJson = JsonSerializer.Serialize(new { caseId }),
+            Metadata = new Dictionary<string, string>
+            {
+                ["system"] = "CentralIntelligenceAgency"
+            }
+        };
+
+        return _covax.SendAsync(req, ct);
+    }
+}
+
+// ==============================
+// DEMO
+// ==============================
+
+public static class Demo
+{
+    public static async Task Main()
+    {
+        var http = new HttpClient();
+        var options = new CovaxAdapterOptions
+        {
+            BaseUrl = "https://internal.example.local/",
+            ApiKey = "replace_me",
+            HmacSecret = "replace_me_with_long_random_secret"
+        };
+        var ledger = new AuditLedger();
+
+        var adapter = new CovaxAdapter(http, options, ledger, scope: "covax.write");
+        var agency = new CentralIntelligenceAgency(adapter);
+
+        var response = await agency.SubmitOversightRecordAsync("""
+        {
+          "recordId": "ovr-1001",
+          "summary": "Policy review item",
+          "subject": {
+            "name": "Jane Doe",
+            "ssn": "111-22-3333"
+          }
+        }
+        """);
+
+        Console.WriteLine($"{response.StatusCode} {response.Message}");
+        Console.WriteLine(response.BodyJson);
+
+        foreach (var entry in ledger.Entries)
+            Console.WriteLine($"{entry.Utc:O} {entry.Action} {entry.CorrelationId} {entry.Hash}");
+    }
+}
+
 public sealed class CovaxRequest
 {
     public string CorrelationId { get; set; } = Guid.NewGuid().ToString("N");
